@@ -4,13 +4,25 @@ import struct
 import wrapper
 import threading
 import time
+import binascii
 from wrapper import recv_from_any_link, send_to_link, get_switch_mac, get_interface_name
 MAC_table = {}
+
+STP_COST = 10 
+STP_MAX_AGE = 20 * 256     
+STP_HELLO_TIME = 2 * 256   
+STP_FORWARD_DELAY = 15 * 256 
+
+root_bridge_ID = 0          
+root_path_cost = 0          
+root_port = -1              
+ppdu_seq_num = 0            
 
 class SwitchConfig:
     BID: int  # Bridge ID
     vlan_ports: dict  # port -> vlan_id
     trunk_ports: list  # List of trunk ports
+    port_states: dict  # port -> STP state
     def __init__(self, config_file):
         self.vlan_ports = {}
         self.trunk_ports = []
@@ -84,6 +96,147 @@ def is_in_same_vlan(interface1, interface2, switch):
 
 def build_vlan_ext(mac):
     return (sum(int(x, 16)//16 + int(x, 16) % 16 for x in mac.split(':')) & 0xf)
+
+
+def initialize_bridge(switch):
+    global root_bridge_ID, root_path_cost, root_port
+
+    root_bridge_ID = switch.config_id
+    root_path_cost = 0
+    root_port = -1 
+
+    for port, (name, vlan_type, _) in switch.vlans.items():
+        if vlan_type == "T":
+            switch.vlans[port] = (name, vlan_type, "DESIGNATED")
+        else:
+            switch.vlans[port] = (name, vlan_type, "FORWARDING")
+
+def send_ppdu(port, switch, src_mac):
+    
+    dest_mac = binascii.unhexlify("01:80:c2:00:00:00".replace(':', ''))
+    llc_len = 44
+    llc_header = struct.pack("!HBBB", llc_len, 0x42, 0x42, 0x03)
+    
+    protocol_id = 0x0002
+    protocol_version = 0
+    type = 0x80
+    header = struct.pack("!HBB I", protocol_id, protocol_version, type, ppdu_seq_num)
+    ppdu_seq_num = (ppdu_seq_num + 1) % 100 
+
+    port_id = 0x8000 | port 
+    flags = 0
+    message_age = 0 
+    
+    data = struct.pack("!B Q I Q H H H H H",  # 1+8+4+8+2+2+2+2+2 = 31 bytes
+                            flags,
+                            root_bridge_ID,
+                            root_path_cost,
+                            switch.BID,
+                            port_id,
+                            message_age,
+                            STP_MAX_AGE,
+                            STP_HELLO_TIME,
+                            STP_FORWARD_DELAY)
+
+    frame = dest_mac + src_mac + llc_header + header + data
+    send_to_link(port, len(frame), frame)
+
+
+def receive_ppdu(switch, data, port):
+    global root_bridge_ID, root_path_cost, root_port
+    
+    # 1. Validate frame
+    if len(data) < 56:  # ✅ Minimum PPDU frame size
+        return
+    
+    # Verify LLC Control byte (byte 16)
+    if data[16] != 0x03:
+        return
+    
+    # Verify PPDU Type (byte 20)
+    if data[20] != 0x80:
+        return
+    
+    # 2. Extract PPDU_CONFIG (starts at byte 25)
+    # Skip flags (byte 25), extract main fields
+    ppdu_flags = data[25]
+    ppdu_root_bridge, ppdu_root_path, ppdu_sender_id = struct.unpack("!QIQ", data[26:46])
+    ppdu_port_id, ppdu_msg_age, ppdu_max_age = struct.unpack("!HHH", data[46:52])
+    
+    # 3. Calculate cost via this port
+    cost_via_port = ppdu_root_path + STP_COST
+    
+    # 4. Determine if this PPDU is better than current root
+    is_ppdu_better = (
+        ppdu_root_bridge < root_bridge_ID or
+        (ppdu_root_bridge == root_bridge_ID and cost_via_port < root_path_cost) or
+        (ppdu_root_bridge == root_bridge_ID and cost_via_port == root_path_cost and 
+         ppdu_sender_id < switch.BID)
+    )
+    
+    # 5. Update root information if better PPDU received
+    if is_ppdu_better:
+        # If we had a different root port, change its state
+        if root_port != -1 and root_port != port and root_port in switch.trunk_ports:
+            # Old root port becomes designated
+            pass  # Update state here
+        
+        # Update root info
+        root_bridge_ID = ppdu_root_bridge
+        root_path_cost = cost_via_port
+        root_port = port
+        
+        # Mark this port as ROOT port
+        # (You need a data structure to store port states)
+        
+    else:
+        # This is not a better path to root
+        if port == root_port:
+            # Update cost if needed
+            if cost_via_port < root_path_cost:
+                root_path_cost = cost_via_port
+            return
+        
+        # Determine if this port should be DESIGNATED or BLOCKED
+        is_local_designated = (
+            cost_via_port > root_path_cost or
+            (cost_via_port == root_path_cost and switch.BID < ppdu_sender_id)
+        )
+        
+        if is_local_designated:
+            # Set port to DESIGNATED state
+            pass
+        else:
+            # Set port to BLOCKED state
+            pass
+    
+    # 6. If we are root, all our ports are DESIGNATED
+    if switch.BID == root_bridge_ID:
+        # Set all trunk ports to DESIGNATED
+        pass
+
+def send_hello(port, src_mac):
+    dest_mac = binascii.unhexlify("ff:ff:ff:ff:ff:ff".replace(':', ''))
+    ethertype = struct.pack("!H", 0x0800)
+    payload = b'Hello!:p'
+    frame = dest_mac + src_mac + ethertype + payload
+    send_to_link(port, len(frame), frame)
+
+def send_hello_every_sec(switch, src_mac):
+    """Thread-ul care trimite HPDU și ppdu periodic (la fiecare 1 sec)."""
+    while True:
+        for i in switch.trunk_ports:
+            send_hello(i, src_mac)
+        for i in switch.vlan_ports.keys():
+            send_hello(i, src_mac)
+                # 2. Trimite PPDU DOAR pe porturile trunk în stare DESIGNATED
+        for port in switch.trunk_ports:
+            if switch.port_states[port] == "DESIGNATED":
+                send_ppdu(port, switch)
+        time.sleep(1)
+    
+
+
 def main():
     # init returns the max interface number. Our interfaces
     # are 0, 1, 2, ..., init_ret value + 1
@@ -106,8 +259,12 @@ def main():
 
 
     # Example of running a function on a separate thread.
-    t = threading.Thread(target=function_on_different_thread)
+    my_mac = ':'.join(f'{b:02x}' for b in get_switch_mac())
+    t = threading.Thread(target=send_hello_every_sec, args=(switch, my_mac, ))
     t.start()
+
+    if ':'.join(f'{b:02x}' for b in get_switch_mac()) == "01:80:c2:00:00:00":
+        receive_ppdu(switch, data, interface)
 
     # Printing interface names
     for i in interfaces:
